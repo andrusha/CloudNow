@@ -61,12 +61,43 @@ protocol InputEventHandler: AnyObject {
 
 // MARK: - Encoded Packet
 
+enum InputPacketCategory: String, Sendable {
+    case heartbeat
+    case gamepadSnapshot
+    case keyboard
+    case mouseButton
+    case mouseMove
+    case mouseWheel
+}
+
+enum InputSendDisposition: Sendable {
+    case accepted
+    case channelUnavailable
+    case rejected
+    case superseded
+}
+
 /// Reusable fixed-capacity storage handed from InputSender to the WebRTC send queue.
 final class EncodedInputPacket: @unchecked Sendable {
     static let capacity = 64
 
-    let storage = NSMutableData(length: capacity)!
-    private(set) var count = 0
+    nonisolated(unsafe) let storage = NSMutableData(length: capacity)!
+    nonisolated(unsafe) private(set) var count = 0
+    nonisolated(unsafe) private(set) var category: InputPacketCategory = .heartbeat
+    nonisolated(unsafe) private(set) var generatedAt: UInt64 = 0
+    nonisolated(unsafe) private(set) var gamepadSlot: Int?
+    nonisolated(unsafe) private(set) var isReplaceableGamepadSnapshot = false
+
+    func markGenerated(
+        as category: InputPacketCategory,
+        gamepadSlot: Int? = nil,
+        replaceableGamepadSnapshot: Bool = false
+    ) {
+        self.category = category
+        self.gamepadSlot = gamepadSlot
+        isReplaceableGamepadSnapshot = replaceableGamepadSnapshot
+        generatedAt = DispatchTime.now().uptimeNanoseconds
+    }
 
     func prepare(length: Int) -> UnsafeMutableRawBufferPointer {
         precondition(length <= Self.capacity)
@@ -347,7 +378,7 @@ private func axisToInt16(_ value: Float) -> Int16 {
 
 /// Abstracts the WebRTC data channel so the WebRTC dependency stays in GFNStreamController.
 protocol DataChannelSender: AnyObject {
-    func sendData(_ packet: EncodedInputPacket, completion: @escaping () -> Void)
+    func sendData(_ packet: EncodedInputPacket, completion: @escaping (InputSendDisposition) -> Void)
 }
 
 // MARK: - InputSender
@@ -539,14 +570,24 @@ final class InputSender {
 
     // MARK: Private — Tick
 
-    private func sendEncoded(_ encode: (EncodedInputPacket) -> Void) {
+    private func sendEncoded(
+        category: InputPacketCategory,
+        gamepadSlot: Int? = nil,
+        replaceableGamepadSnapshot: Bool = false,
+        _ encode: (EncodedInputPacket) -> Void
+    ) {
         let packet = packetPool.popLast() ?? EncodedInputPacket()
+        packet.markGenerated(
+            as: category,
+            gamepadSlot: gamepadSlot,
+            replaceableGamepadSnapshot: replaceableGamepadSnapshot
+        )
         encode(packet)
         guard let channel else {
             packetPool.append(packet)
             return
         }
-        channel.sendData(packet) { [weak self, packet] in
+        channel.sendData(packet) { [weak self, packet] _ in
             self?.inputQueue.async { [weak self, packet] in
                 self?.packetPool.append(packet)
             }
@@ -557,7 +598,7 @@ final class InputSender {
         let now = DispatchTime.now().uptimeNanoseconds
         if now &- lastHeartbeat >= Self.heartbeatInterval {
             lastHeartbeat = now
-            sendEncoded { encoder.encodeHeartbeat(into: $0) }
+            sendEncoded(category: .heartbeat) { encoder.encodeHeartbeat(into: $0) }
         }
         guard !isPaused else { return }
 
@@ -747,13 +788,25 @@ final class InputSender {
         now: UInt64 = DispatchTime.now().uptimeNanoseconds,
         force: Bool = false
     ) {
+        let previous = lastSnapshots[slot]
         let lastSend = lastSnapshotSend[slot] ?? 0
-        guard force || lastSnapshots[slot] != snapshot || now &- lastSend >= Self.gamepadKeepAlive else {
+        guard force || previous != snapshot || now &- lastSend >= Self.gamepadKeepAlive else {
             return
         }
+        let returnedToNeutral = previous.map {
+            isAnalogActive($0) && !isAnalogActive(snapshot)
+        } ?? false
+        let isReplaceable = !force
+            && previous?.buttons == snapshot.buttons
+            && previous?.bitmap == snapshot.bitmap
+            && !returnedToNeutral
         lastSnapshots[slot] = snapshot
         lastSnapshotSend[slot] = now
-        sendEncoded {
+        sendEncoded(
+            category: .gamepadSnapshot,
+            gamepadSlot: slot,
+            replaceableGamepadSnapshot: isReplaceable
+        ) {
             encoder.encodeGamepad(
                 controllerId: slot,
                 buttons: snapshot.buttons,
@@ -767,6 +820,15 @@ final class InputSender {
                 into: $0
             )
         }
+    }
+
+    private func isAnalogActive(_ snapshot: GamepadSnapshot) -> Bool {
+        snapshot.leftTrigger != 0
+            || snapshot.rightTrigger != 0
+            || snapshot.leftStickX != 0
+            || snapshot.leftStickY != 0
+            || snapshot.rightStickX != 0
+            || snapshot.rightStickY != 0
     }
 
     private func finishOverlayPress(for controller: GCController, slot: Int) {
@@ -882,7 +944,7 @@ final class InputSender {
         let dx = Int16(clamping: physical.x + micro.x + dualSense.x)
         let dy = Int16(clamping: physical.y + micro.y + dualSense.y)
         guard dx != 0 || dy != 0 else { return }
-        sendEncoded { encoder.encodeMouseMove(dx: dx, dy: dy, into: $0) }
+        sendEncoded(category: .mouseMove) { encoder.encodeMouseMove(dx: dx, dy: dy, into: $0) }
     }
 
     private func drainWholePixels(from delta: inout (x: Float, y: Float)) -> (x: Int, y: Int) {
@@ -916,11 +978,11 @@ final class InputSender {
 
     private func sendMouseWheelNow(_ delta: Int16) {
         guard !isPaused else { return }
-        sendEncoded { encoder.encodeMouseWheel(delta: delta, into: $0) }
+        sendEncoded(category: .mouseWheel) { encoder.encodeMouseWheel(delta: delta, into: $0) }
     }
 
     private func emitMouseButton(down: Bool, button: UInt8) {
-        sendEncoded { encoder.encodeMouseButton(down: down, button: button, into: $0) }
+        sendEncoded(category: .mouseButton) { encoder.encodeMouseButton(down: down, button: button, into: $0) }
     }
 
     private func emitKeyboard(
@@ -929,7 +991,7 @@ final class InputSender {
         scancode: UInt16,
         modifiers: UInt16
     ) {
-        sendEncoded {
+        sendEncoded(category: .keyboard) {
             encoder.encodeKeyboard(
                 down: down,
                 vk: vk,
