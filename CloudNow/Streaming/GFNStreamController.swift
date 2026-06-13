@@ -65,6 +65,14 @@ struct StreamStats {
     var newestGamepadAgeMs: Double = 0
     var inputChannelState: String = "closed"
     var selectedNetworkPath: String = "Unknown"
+    var selectedCandidatePairId: String = ""
+    var selectedProtocol: String = ""
+    var localCandidateType: String = ""
+    var remoteCandidateType: String = ""
+    var localCandidateAddress: String = ""
+    var remoteCandidateAddress: String = ""
+    var availableIncomingBitrateKbps: Int = 0
+    var candidatePairChanges: Int = 0
 }
 
 private struct VideoStatsSnapshot: Sendable {
@@ -98,6 +106,28 @@ private struct VideoStatsSnapshot: Sendable {
 private struct ConnectionStatsSnapshot: Sendable {
     var rttMs: Double
     var selectedNetworkPath: String
+    var selectedCandidatePairId: String
+    var selectedProtocol: String
+    var localCandidateType: String
+    var remoteCandidateType: String
+    var localCandidateAddress: String
+    var remoteCandidateAddress: String
+    var availableIncomingBitrateKbps: Int
+}
+
+private struct IceCandidateSnapshot: Sendable {
+    var protocolName: String
+    var candidateType: String
+    var address: String
+}
+
+private struct IcePairSnapshot: Sendable {
+    var id: String
+    var localID: String
+    var remoteID: String
+    var rttMs: Double
+    var availableIncomingBitrateKbps: Int
+    var nominated: Bool
 }
 
 private let streamStatsParsingQueue = DispatchQueue(
@@ -168,6 +198,8 @@ final class GFNStreamController: NSObject {
     private var statsGeneration = 0
     private var videoStatsRequestInFlight = false
     private var connectionStatsRequestInFlight = false
+    private var previousSelectedCandidatePairId = ""
+    private var lastZoneRttFeedbackAt: Date?
 
     private static let factory: LKRTCPeerConnectionFactory = {
         LKRTCInitializeSSL()
@@ -188,8 +220,11 @@ final class GFNStreamController: NSObject {
         state = .connecting
         sessionInfo = session
         self.settings = settings
+        stats = StreamStats()
         setStatsMode(settings.statsMode)
         stats.gpuType = session.gpuType ?? ""
+        previousSelectedCandidatePairId = ""
+        lastZoneRttFeedbackAt = nil
         inputSendQueue.sync {
             inputGenerated = 0
             inputSubmitted = 0
@@ -323,6 +358,8 @@ final class GFNStreamController: NSObject {
         inputReady = false
         previousVideoStats = nil
         statsTick = 0
+        previousSelectedCandidatePairId = ""
+        lastZoneRttFeedbackAt = nil
         videoView?.inputHandler = nil
         videoView?.menuPressHandler = nil
         videoView = nil
@@ -377,8 +414,10 @@ final class GFNStreamController: NSObject {
 
     private func handleOffer(sdp: String) async {
         guard let session = sessionInfo else { return }
+#if DEBUG
         print("[Stream] Offer SDP (\(sdp.count) chars):")
         sdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+#endif
 
         // Configure audio session for real-time streaming before creating the peer connection.
         // .playback + .moviePlayback gives the lowest latency path; allowBluetooth covers
@@ -507,8 +546,10 @@ final class GFNStreamController: NSObject {
                 ? SDPMunger.rewriteH265LevelId(SDPMunger.rewriteH265TierFlag(codecFilteredSdp))
                 : codecFilteredSdp
             let mangledAnswerSdp = SDPMunger.injectBandwidth(h265SafeSdp, videoKbps: settings.maxBitrateKbps)
+#if DEBUG
             print("[Stream] Answer SDP (\(mangledAnswerSdp.count) chars):")
             mangledAnswerSdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+#endif
 
             // Set local description
             let localSDP = LKRTCSessionDescription(type: .answer, sdp: mangledAnswerSdp)
@@ -762,8 +803,7 @@ final class GFNStreamController: NSObject {
                         guard let self, self.statsGeneration == generation else { return }
                         self.connectionStatsRequestInFlight = false
                         if let snapshot {
-                            self.stats.rttMs = snapshot.rttMs
-                            self.stats.selectedNetworkPath = snapshot.selectedNetworkPath
+                            self.applyConnectionStats(snapshot)
                         }
                     }
                 }
@@ -862,27 +902,34 @@ final class GFNStreamController: NSObject {
     nonisolated private static func parseConnectionStats(
         _ report: LKRTCStatisticsReport
     ) -> ConnectionStatsSnapshot? {
-        var candidateDetails: [String: (protocolName: String, candidateType: String)] = [:]
-        var candidatePairs: [
-            String: (localID: String, remoteID: String, rttMs: Double, nominated: Bool)
-        ] = [:]
+        var candidateDetails: [String: IceCandidateSnapshot] = [:]
+        var candidatePairs: [String: IcePairSnapshot] = [:]
         var selectedCandidatePairID: String?
 
         for (id, stat) in report.statistics {
             if stat.type == "local-candidate" || stat.type == "remote-candidate" {
-                candidateDetails[id] = (
+                let address = stat.values["address"] as? String
+                    ?? stat.values["ip"] as? String
+                    ?? ""
+                let port = Int(numericValue(stat.values["port"]))
+                candidateDetails[id] = IceCandidateSnapshot(
                     protocolName: (stat.values["protocol"] as? String ?? "").lowercased(),
-                    candidateType: (stat.values["candidateType"] as? String ?? "").lowercased()
+                    candidateType: (stat.values["candidateType"] as? String ?? "").lowercased(),
+                    address: port > 0 ? "\(address):\(port)" : address
                 )
             } else if stat.type == "transport" {
                 selectedCandidatePairID = stat.values["selectedCandidatePairId"] as? String
                     ?? selectedCandidatePairID
             } else if stat.type == "candidate-pair",
                       stat.values["state"] as? String == "succeeded" {
-                candidatePairs[id] = (
+                candidatePairs[id] = IcePairSnapshot(
+                    id: id,
                     localID: stat.values["localCandidateId"] as? String ?? "",
                     remoteID: stat.values["remoteCandidateId"] as? String ?? "",
                     rttMs: numericValue(stat.values["currentRoundTripTime"]) * 1000,
+                    availableIncomingBitrateKbps: Int(
+                        numericValue(stat.values["availableIncomingBitrate"]) / 1000
+                    ),
                     nominated: boolValue(stat.values["nominated"]) == true
                 )
             }
@@ -910,7 +957,14 @@ final class GFNStreamController: NSObject {
         }
         return ConnectionStatsSnapshot(
             rttMs: selected.rttMs,
-            selectedNetworkPath: path
+            selectedNetworkPath: path,
+            selectedCandidatePairId: selected.id,
+            selectedProtocol: protocolName,
+            localCandidateType: local?.candidateType ?? "",
+            remoteCandidateType: remote?.candidateType ?? "",
+            localCandidateAddress: local?.address ?? "",
+            remoteCandidateAddress: remote?.address ?? "",
+            availableIncomingBitrateKbps: selected.availableIncomingBitrateKbps
         )
     }
 
@@ -920,6 +974,37 @@ final class GFNStreamController: NSObject {
 
     nonisolated private static func boolValue(_ value: Any?) -> Bool? {
         (value as? NSNumber)?.boolValue
+    }
+
+    private func applyConnectionStats(_ sample: ConnectionStatsSnapshot) {
+        if !previousSelectedCandidatePairId.isEmpty,
+           previousSelectedCandidatePairId != sample.selectedCandidatePairId {
+            stats.candidatePairChanges += 1
+            print(
+                "[ICE] Selected pair changed: \(previousSelectedCandidatePairId)"
+                + " -> \(sample.selectedCandidatePairId)"
+            )
+        }
+        previousSelectedCandidatePairId = sample.selectedCandidatePairId
+
+        stats.rttMs = sample.rttMs
+        stats.selectedNetworkPath = sample.selectedNetworkPath
+        stats.selectedCandidatePairId = sample.selectedCandidatePairId
+        stats.selectedProtocol = sample.selectedProtocol
+        stats.localCandidateType = sample.localCandidateType
+        stats.remoteCandidateType = sample.remoteCandidateType
+        stats.localCandidateAddress = sample.localCandidateAddress
+        stats.remoteCandidateAddress = sample.remoteCandidateAddress
+        stats.availableIncomingBitrateKbps = sample.availableIncomingBitrateKbps
+
+        let now = Date()
+        if sample.rttMs > 0,
+           lastZoneRttFeedbackAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true,
+           let zoneUrl = sessionInfo?.zone,
+           !zoneUrl.isEmpty {
+            lastZoneRttFeedbackAt = now
+            Task { await ZoneClient.shared.recordSessionRtt(zoneUrl: zoneUrl, rttMs: sample.rttMs) }
+        }
     }
 
     private func applyVideoStats(_ sample: VideoStatsSnapshot) {
